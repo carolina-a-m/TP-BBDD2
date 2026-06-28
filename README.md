@@ -19,7 +19,7 @@ Data Warehouse para The Drinking Company (TDC), construido con SQL Server, SSIS 
 
 Los archivos `.bak` están en Google Drive por límite de tamaño de GitHub:
 
-🔗 **[Descargar backups desde Google Drive]([https://drive.google.com/file/d/17wfydg1AL2gYeOuLpkYpDbT2WzbH1YUf/view?usp=drive_link](https://drive.google.com/drive/folders/1fzU8gUplK1PsnpUnH14lYZTV_7Fy3opW?usp=drive_link)**
+🔗 **[Descargar backups desde Google Drive](https://drive.google.com/drive/folders/1fzU8gUplK1PsnpUnH14lYZTV_7Fy3opW?usp=drive_link)**
 
 Contiene:
 - `bd_datawarehouse_2025_G15.bak`
