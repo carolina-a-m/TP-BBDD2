@@ -135,55 +135,34 @@ CREATE TABLE [dbo].[stg_stock_G06](
 GO
 
 
--- ============================================================
--- VISTA: vw_stg_ventas_procesadas (version final)
---
--- Cambios respecto al original:
---   1. VentasHistoricas: region = 'N/A' (la fuente historica no tiene region)
---   2. VentasHistoricas: branch_id = -1 (la fuente historica no tiene sucursal)
---   3. VentasActuales: region mapea 'NORTH' -> 'Central' para alinear con DIM_GEOGRAFIA
---   4. VentasActuales: GROUP BY para consolidar lineas duplicadas por producto
---   5. VentasDeduplicadas: CTE nuevo que elimina duplicados BillingID+ProductoID
---      que aparecen cuando un billing_id existe en AMBAS fuentes (historica y actual)
---   6. Precio vigente via OUTER APPLY sobre stg_prices_G06
---   7. Descuento por factura: maximo porcentaje aplicable segun fecha y monto total
---   8. Join con DIM_PRODUCTO para obtener CapacidadML y calcular Litros
--- ============================================================
+-- =============================================
+-- VISTA: vw_stg_ventas_procesadas
+-- Unifica ventas históricas (SQL Server) y actuales (MySQL)
+-- Calcula precios vigentes, descuentos y litros por presentación
+-- =============================================
+IF OBJECT_ID('dbo.vw_stg_ventas_procesadas', 'V') IS NOT NULL
+    DROP VIEW dbo.vw_stg_ventas_procesadas;
+GO
 
-CREATE VIEW [dbo].[vw_stg_ventas_procesadas] AS
+CREATE VIEW dbo.vw_stg_ventas_procesadas AS
 WITH
 VentasHistoricas AS (
-    SELECT
-        billing_id,
-        [date]        AS Fecha,
-        customer_id,
-        employee_id,
-        product_id,
-        SUM(quantity) AS quantity,
-        -1            AS branch_id,   -- sentinel: historico no tiene sucursal
-        'N/A'         AS region       -- sentinel: historico no tiene region
+    SELECT 
+        billing_id, [date] AS Fecha, customer_id, employee_id, product_id,
+        SUM(quantity) AS quantity, -1 AS branch_id, 'N/A' AS region
     FROM dbo.stg_billing_history_G06
     WHERE product_id IS NOT NULL
     GROUP BY billing_id, [date], customer_id, employee_id, product_id
 ),
 VentasActuales AS (
-    SELECT
-        b.billing_id,
-        b.[date]          AS Fecha,
-        b.customer_id,
-        b.employee_id,
-        bd.product_id,
-        SUM(bd.quantity)  AS quantity,
-        b.branch_id,
-        CASE
-            WHEN UPPER(b.region) = 'NORTH' THEN 'Central'
-            ELSE b.region
-        END               AS region
+    SELECT 
+        b.billing_id, b.[date] AS Fecha, b.customer_id, b.employee_id, bd.product_id,
+        SUM(bd.quantity) AS quantity, b.branch_id,
+        CASE WHEN UPPER(b.region) = 'NORTH' THEN 'Central' ELSE b.region END AS region
     FROM dbo.stg_billing_G06 b
     INNER JOIN dbo.stg_billing_detail_G06 bd ON b.billing_id = bd.billing_id
     WHERE bd.product_id IS NOT NULL
-    GROUP BY b.billing_id, b.[date], b.customer_id, b.employee_id,
-             bd.product_id, b.branch_id, b.region
+    GROUP BY b.billing_id, b.[date], b.customer_id, b.employee_id, bd.product_id, b.branch_id, b.region
 ),
 VentasUnificadas AS (
     SELECT * FROM VentasHistoricas
@@ -191,25 +170,17 @@ VentasUnificadas AS (
     SELECT * FROM VentasActuales
 ),
 VentasDeduplicadas AS (
-    -- Consolida casos donde el mismo billing_id+product_id aparece
-    -- en ambas fuentes (historica y actual)
     SELECT
-        billing_id,
-        MIN(Fecha)       AS Fecha,
-        customer_id,
-        employee_id,
-        product_id,
-        SUM(quantity)    AS quantity,
-        MIN(branch_id)   AS branch_id,
-        MIN(region)      AS region
+        billing_id, MIN(Fecha) AS Fecha, customer_id, employee_id, product_id,
+        SUM(quantity) AS quantity, MIN(branch_id) AS branch_id, MIN(region) AS region
     FROM VentasUnificadas
     GROUP BY billing_id, customer_id, employee_id, product_id
 ),
 VentasConPrecio AS (
-    SELECT
+    SELECT 
         v.*,
-        ISNULL(p.PriceVigente, 0)                        AS PrecioUnitario,
-        v.quantity * ISNULL(p.PriceVigente, 0)           AS MontoBrutoLinea
+        ISNULL(p.PriceVigente, 0) AS PrecioUnitario,
+        v.quantity * ISNULL(p.PriceVigente, 0) AS MontoBrutoLinea
     FROM VentasDeduplicadas v
     OUTER APPLY (
         SELECT TOP 1 TRY_CAST(pr.price AS DECIMAL(18,2)) AS PriceVigente
@@ -220,18 +191,13 @@ VentasConPrecio AS (
     ) p
 ),
 CabeceraFactura AS (
-    SELECT
-        billing_id,
-        MIN(Fecha)           AS FechaFactura,
-        SUM(MontoBrutoLinea) AS TotalFactura
+    SELECT billing_id, MIN(Fecha) AS FechaFactura, SUM(MontoBrutoLinea) AS TotalFactura
     FROM VentasConPrecio
     GROUP BY billing_id
 ),
 DescuentoPorFactura AS (
-    -- Aplica el mejor descuento (mayor porcentaje) vigente para la fecha y monto
-    SELECT
-        cf.billing_id,
-        cf.TotalFactura,
+    SELECT 
+        cf.billing_id, cf.TotalFactura,
         ISNULL(MAX(TRY_CAST(d.percentage AS DECIMAL(5,2))), 0) AS PorcentajeDescuento
     FROM CabeceraFactura cf
     LEFT JOIN dbo.stg_discounts_G06 d
@@ -239,25 +205,38 @@ DescuentoPorFactura AS (
         AND (d.[until] IS NULL OR cf.FechaFactura <= TRY_CAST(d.[until] AS DATETIME))
         AND cf.TotalFactura >= TRY_CAST(d.total_billing AS DECIMAL(18,2))
     GROUP BY cf.billing_id, cf.TotalFactura
+),
+CapacidadProducto AS (
+    SELECT
+        CodProducto,
+        CAST(CASE UPPER(LTRIM(RTRIM(PresentacionProducto)))
+            WHEN '1 LITER'     THEN 1000
+            WHEN '2 LITER'     THEN 2000
+            WHEN '670 CM3'     THEN 670
+            WHEN '330 CM3 CAN' THEN 330
+            WHEN '500 CM3 CAN' THEN 500
+            ELSE 0
+        END AS DECIMAL(10,2)) AS CapacidadML
+    FROM dbo.stg_productos_G06
 )
-SELECT
-    CAST(v.Fecha AS DATE)                                                             AS FechaVenta,
-    v.billing_id                                                                      AS BillingID,
-    CAST(v.customer_id AS VARCHAR(50))                                                AS CustomerID,
-    CAST(v.employee_id AS VARCHAR(50))                                                AS EmployeeID,
-    v.product_id                                                                      AS ProductoID,
-    v.branch_id                                                                       AS BranchID,
-    v.region                                                                          AS Region,
-    v.quantity                                                                        AS Cantidad,
-    CAST((v.quantity * dp.CapacidadML) / 1000.0 AS DECIMAL(18,2))                   AS Litros,
-    CAST(v.MontoBrutoLinea AS DECIMAL(18,2))                                         AS MontoBruto,
-    CAST(df.TotalFactura AS DECIMAL(18,2))                                           AS Total,
-    CAST(df.PorcentajeDescuento AS DECIMAL(5,2))                                     AS PorcentajeDescuento,
-    CAST(df.TotalFactura * df.PorcentajeDescuento / 100.0 AS DECIMAL(18,2))         AS TotalDescuento,
-    CAST(df.TotalFactura * (1.0 - df.PorcentajeDescuento / 100.0) AS DECIMAL(18,2)) AS MontoNeto
+SELECT 
+    CAST(v.Fecha AS DATE)                                                               AS FechaVenta,
+    v.billing_id                                                                        AS BillingID,
+    CAST(v.customer_id AS VARCHAR(50))                                                  AS CustomerID,
+    CAST(v.employee_id AS VARCHAR(50))                                                  AS EmployeeID,
+    v.product_id                                                                        AS ProductoID,
+    v.branch_id                                                                         AS BranchID,
+    v.region                                                                            AS Region,
+    v.quantity                                                                          AS Cantidad,
+    CAST((v.quantity * ISNULL(cp.CapacidadML, 0)) / 1000.0 AS DECIMAL(18,2))          AS Litros,
+    CAST(v.MontoBrutoLinea AS DECIMAL(18,2))                                           AS MontoBruto,
+    CAST(df.TotalFactura AS DECIMAL(18,2))                                             AS Total,
+    CAST(df.PorcentajeDescuento AS DECIMAL(5,2))                                       AS PorcentajeDescuento,
+    CAST(df.TotalFactura * df.PorcentajeDescuento / 100.0 AS DECIMAL(18,2))           AS TotalDescuento,
+    CAST(df.TotalFactura * (1.0 - df.PorcentajeDescuento / 100.0) AS DECIMAL(18,2))   AS MontoNeto
 FROM VentasConPrecio v
 INNER JOIN DescuentoPorFactura df ON v.billing_id = df.billing_id
-INNER JOIN bd_datawarehouse_2025_G15.dbo.DIM_PRODUCTO dp ON v.product_id = dp.ProductoID
+LEFT JOIN CapacidadProducto cp ON v.product_id = cp.CodProducto
 WHERE v.Fecha IS NOT NULL;
 GO
 
