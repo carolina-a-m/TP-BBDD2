@@ -62,6 +62,23 @@ Ejecutar en este orden desde Visual Studio:
 
 ---
 
+## ⚠️ Nota importante: Carga de feriados
+
+Luego de ejecutar todos los paquetes SSIS, correr manualmente el siguiente 
+UPDATE en `bd_datawarehouse_2025_G15` para poblar los feriados en DIM_TIEMPO:
+
+```sql
+UPDATE t
+SET t.EsFeriado = 1,
+    t.NombreFeriado = h.HOLIDAY
+FROM [dbo].[DIM_TIEMPO] t
+JOIN bd_staging_2026_G06.dbo.stg_holidays_G06 h
+    ON CAST(h.[DATE] AS DATE) = t.Fecha;
+```
+
+Pendiente: incorporar este paso al paquete `Dim-holidays.dtsx` como 
+Execute SQL Task al final del Control Flow.
+
 ## Notas importantes
 
 - Los scripts SQL crean las bases **desde cero**. Si ya existen las bases, borrarlas antes de ejecutar los scripts.
